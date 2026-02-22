@@ -307,10 +307,17 @@ func (t *ExecTool) guardCommand(command, cwd string) string {
 			return ""
 		}
 
-		pathPattern := regexp.MustCompile(`[A-Za-z]:\\[^\\\"']+|/[^\s\"']+`)
-		matches := pathPattern.FindAllString(cmd, -1)
+		// Match only path-like tokens that start at command start or after common
+		// argument separators. This avoids false positives from embedded slashes in
+		// strings such as user agents (e.g. "Mozilla/5.0") and URLs (e.g. "https://...").
+		pathPattern := regexp.MustCompile(`(^|[\s"'|&;()])([A-Za-z]:\\[^\\\"']+|/[^\s\"']+)`)
+		matches := pathPattern.FindAllStringSubmatch(cmd, -1)
 
-		for _, raw := range matches {
+		for _, match := range matches {
+			if len(match) < 3 {
+				continue
+			}
+			raw := match[2]
 			p, err := filepath.Abs(raw)
 			if err != nil {
 				continue
