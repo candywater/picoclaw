@@ -10,6 +10,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +38,7 @@ type AgentLoop struct {
 	state          *state.Manager
 	running        atomic.Bool
 	summarizing    sync.Map
+	promptLogMu    sync.Mutex
 	fallback       *providers.FallbackChain
 	channelManager *channels.Manager
 }
@@ -543,6 +546,7 @@ func (al *AgentLoop) runLLMIteration(
 		// Retry loop for context/token errors
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
+			al.writeFullPromptLog(agent, opts, iteration, retry, messages, providerToolDefs)
 			response, err = callLLM()
 			if err == nil {
 				break
@@ -878,6 +882,61 @@ func formatMessagesForLog(messages []providers.Message) string {
 	}
 	sb.WriteString("]")
 	return sb.String()
+}
+
+// writeFullPromptLog writes full LLM request payload to workspace log files.
+// Log file path: {workspace}/log/YYYY-MM-DD.log
+func (al *AgentLoop) writeFullPromptLog(
+	agent *AgentInstance,
+	opts processOptions,
+	iteration int,
+	retry int,
+	messages []providers.Message,
+	toolDefs []providers.ToolDefinition,
+) {
+	if agent == nil || strings.TrimSpace(agent.Workspace) == "" {
+		return
+	}
+
+	now := time.Now()
+	logDir := filepath.Join(agent.Workspace, "log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return
+	}
+
+	logFile := filepath.Join(logDir, now.Format("2006-01-02")+".log")
+
+	entry := map[string]any{
+		"type":        "llm_prompt",
+		"timestamp":   now.UTC().Format(time.RFC3339Nano),
+		"agent_id":    agent.ID,
+		"session_key": opts.SessionKey,
+		"channel":     opts.Channel,
+		"chat_id":     opts.ChatID,
+		"iteration":   iteration,
+		"retry":       retry,
+		"model":       agent.Model,
+		"max_tokens":  agent.MaxTokens,
+		"temperature": agent.Temperature,
+		"messages":    messages,
+		"tools":       toolDefs,
+	}
+
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+
+	al.promptLogMu.Lock()
+	defer al.promptLogMu.Unlock()
+
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	_, _ = f.Write(append(line, '\n'))
 }
 
 // formatToolsForLog formats tool definitions for logging

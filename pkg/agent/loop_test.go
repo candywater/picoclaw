@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -629,5 +631,88 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
 	if len(finalHistory) >= 8 {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	}
+}
+
+func TestAgentLoop_WritesFullPromptLogToWorkspaceByDate(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &simpleMockProvider{response: "ok"}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	longPrompt := strings.Repeat("FULL_PROMPT_SEGMENT_", 40)
+	_, err = al.ProcessDirectWithChannel(context.Background(), longPrompt, "prompt-log-session", "cli", "direct")
+	if err != nil {
+		t.Fatalf("ProcessDirectWithChannel failed: %v", err)
+	}
+
+	logPath := filepath.Join(tmpDir, "log", time.Now().Format("2006-01-02")+".log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("failed to read prompt log file: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one prompt log entry")
+	}
+
+	found := false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry["type"] != "llm_prompt" {
+			continue
+		}
+		messages, ok := entry["messages"].([]any)
+		if !ok || len(messages) == 0 {
+			t.Fatal("expected messages array in prompt log entry")
+		}
+
+		hasFullPrompt := false
+		for _, m := range messages {
+			msgObj, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, _ := msgObj["content"].(string)
+			if strings.Contains(content, longPrompt) {
+				hasFullPrompt = true
+				break
+			}
+		}
+
+		if !hasFullPrompt {
+			t.Fatal("expected full prompt content in workspace prompt log entry")
+		}
+
+		found = true
+		break
+	}
+
+	if !found {
+		t.Fatal("did not find matching llm_prompt entry in date-based workspace log file")
 	}
 }
